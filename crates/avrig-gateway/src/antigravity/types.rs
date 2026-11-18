@@ -189,6 +189,9 @@ pub struct ChatRequest {
     pub tools: Option<Vec<Tool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
+    /// Session id supplied by the calling client. Transport-only, never serialized upstream.
+    #[serde(skip)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

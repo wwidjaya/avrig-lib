@@ -7,16 +7,21 @@ use crate::antigravity::types::{
     ChatCompletionChunkDelta, ChatRequest, ChatResponse, FunctionCallChunkData, FunctionCallData,
     OpenAIUsage, ToolCall, ToolCallChunk,
 };
-use crate::resolver::{is_siwc_model, resolve_upstream_model_id};
+use crate::resolver::{
+    ModelResolutionError, is_builtin_model_prefix, is_siwc_model, resolve_upstream_model_id,
+    strip_model_prefix,
+};
 use crate::siwc::client::SiwcClient;
 use crate::types::{AccountStatus, ModelInfo};
 use anyhow::{Result, anyhow};
 use futures_util::{Stream, StreamExt};
+use rand::RngCore;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 #[derive(Clone)]
@@ -39,6 +44,130 @@ pub struct DirectProviderAccount {
     pub base_url: String,
     pub api_keys: Vec<String>,
     pub next_key_idx: Arc<AtomicUsize>,
+    /// Header name that carries a session id on every chat completion, when the upstream wants one.
+    pub session_header: Option<String>,
+}
+
+impl DirectProviderAccount {
+    /// Pick the api key this request will use.
+    ///
+    /// The index is claimed once per request so the catalogue lookup and the dispatch that
+    /// follows authenticate with the same key, and rotating keys never share a cache entry.
+    pub fn next_key_index(&self) -> usize {
+        if self.api_keys.is_empty() {
+            return 0;
+        }
+        self.next_key_idx.fetch_add(1, Ordering::Relaxed) % self.api_keys.len()
+    }
+
+    /// The api key at `index`, when it is one of the configured non-empty keys.
+    pub fn api_key_at(&self, index: usize) -> Option<&str> {
+        self.api_keys
+            .get(index)
+            .map(String::as_str)
+            .filter(|key| !key.is_empty())
+    }
+}
+
+/// Upstream HTTP rejection that keeps the provider status code.
+///
+/// The rendered message is unchanged from the previous string form, so callers see the same
+/// body text, while tracing can report the status without parsing it back out.
+#[derive(Debug, thiserror::Error)]
+#[error("Direct provider upstream error: {body}")]
+pub struct UpstreamStatusError {
+    pub status: u16,
+    pub body: String,
+}
+
+impl UpstreamStatusError {
+    /// Whether the replayed upstream body says the model name itself is unknown or invalid.
+    ///
+    /// Only 400 and 404 can describe a model fault. Everything else, including a malformed
+    /// `messages` array and token-limit violations, keeps its existing upstream mapping.
+    pub fn reports_unknown_model(&self) -> bool {
+        if !matches!(self.status, 400 | 404) {
+            return false;
+        }
+        let body = self.body.to_ascii_lowercase();
+        const PRECISE_MARKERS: &[&str] = &[
+            "unable to determine provider for model",
+            "unknown model",
+            "model not found",
+            "model_not_found",
+            "no such model",
+            "model does not exist",
+            "unsupported model",
+            "model is not supported",
+            "invalid model name",
+            "invalid model id",
+            "model id is invalid",
+            "model is invalid",
+        ];
+        if PRECISE_MARKERS
+            .iter()
+            .any(|marker| body.contains(marker))
+        {
+            return true;
+        }
+        // Generic upstreams phrase it as "the model `x` does not exist"; require both the
+        // subject and a missing-or-unknown phrase so other 400s are left alone.
+        body.contains("model")
+            && ["does not exist", "not found", "no such"]
+                .iter()
+                .any(|marker| body.contains(marker))
+    }
+}
+
+/// Catalogue cache lifetime. A stale entry is refetched on the next request.
+const CATALOGUE_TTL: Duration = Duration::from_secs(60);
+
+/// Upper bound on a catalogue fetch. A slow catalogue falls back to plain dispatch.
+const CATALOGUE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Cache key for a provider catalogue: one entry per provider and api key index.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CatalogueKey {
+    provider: String,
+    key_index: usize,
+}
+
+enum CatalogueState {
+    Ready(Arc<Vec<String>>),
+    Unavailable,
+}
+
+struct CatalogueEntry {
+    state: CatalogueState,
+    fetched_at: Instant,
+}
+
+/// Routing facts collected while one chat completion is dispatched.
+struct ChatDispatchTrace {
+    provider: String,
+    requested_model: String,
+    resolved_model: String,
+    upstream_status: Option<u16>,
+}
+
+/// Look up a registered direct provider by model prefix.
+///
+/// Provider names come from configuration and model strings come from clients, so the
+/// comparison ignores ASCII case.
+fn find_direct_provider(
+    providers: &HashMap<String, DirectProviderAccount>,
+    prefix: &str,
+) -> Option<DirectProviderAccount> {
+    providers.get(prefix).cloned().or_else(|| {
+        providers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(prefix))
+            .map(|(_, account)| account.clone())
+    })
+}
+
+fn upstream_status_of(err: &anyhow::Error) -> Option<u16> {
+    err.downcast_ref::<UpstreamStatusError>().map(|e| e.status)
 }
 
 #[derive(Clone, Default)]
@@ -49,6 +178,8 @@ pub struct LlmProviderClient {
     pub next_siwc_idx: Arc<AtomicUsize>,
     pub direct_providers: Arc<RwLock<HashMap<String, DirectProviderAccount>>>,
     pub http: reqwest::Client,
+    /// Direct provider model catalogues, keyed by provider and api key index.
+    model_catalogues: Arc<RwLock<HashMap<CatalogueKey, CatalogueEntry>>>,
 }
 
 impl LlmProviderClient {
@@ -60,6 +191,7 @@ impl LlmProviderClient {
             next_siwc_idx: Arc::new(AtomicUsize::new(0)),
             direct_providers: Arc::new(RwLock::new(HashMap::new())),
             http: reqwest::Client::new(),
+            model_catalogues: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -95,7 +227,14 @@ impl LlmProviderClient {
         provider_name: String,
         base_url: String,
         api_keys: Vec<String>,
+        session_header: Option<String>,
     ) {
+        // A blank or malformed header name is a configuration typo, and reqwest panics on an
+        // invalid header name on every request, so an unusable name degrades to "no session
+        // header" instead of taking the provider down at dispatch time.
+        let session_header = session_header
+            .map(|name| name.trim().to_string())
+            .filter(|name| reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_ok());
         let mut map = self.direct_providers.write().await;
         map.insert(
             provider_name.clone(),
@@ -104,6 +243,7 @@ impl LlmProviderClient {
                 base_url,
                 api_keys,
                 next_key_idx: Arc::new(AtomicUsize::new(0)),
+                session_header,
             },
         );
     }
@@ -231,21 +371,269 @@ impl LlmProviderClient {
         Ok(models)
     }
 
-    pub async fn chat_completion(&self, mut input: ChatRequest) -> Result<ChatResponse> {
-        let original_model = input.model.clone();
-        let (prefix, base_model) = crate::resolver::strip_model_prefix(&original_model);
-        input.model = resolve_upstream_model_id(&original_model);
+    /// Model ids advertised by a direct provider, cached per provider and api key index.
+    ///
+    /// `None` means the catalogue is unavailable (transport error, timeout, non-200, or an
+    /// empty body). Callers must keep dispatching in that case: a catalogue outage cannot be
+    /// allowed to break working traffic. Failures are cached for the same short TTL so a
+    /// broken catalogue costs at most one timeout per window.
+    async fn direct_provider_models(
+        &self,
+        direct: &DirectProviderAccount,
+        key_index: usize,
+    ) -> Option<Arc<Vec<String>>> {
+        let cache_key = CatalogueKey {
+            provider: direct.provider_name.clone(),
+            key_index,
+        };
 
-        // Check if explicitly matching a direct provider (e.g. opencode/gpt-5.6-luna)
-        if let Some(p) = prefix {
-            let directs = self.direct_providers.read().await;
-            if let Some(direct) = directs.get(p) {
-                input.model = base_model;
-                return execute_direct_provider_non_stream(&self.http, direct, &input).await;
+        {
+            let cache = self.model_catalogues.read().await;
+            if let Some(entry) = cache.get(&cache_key)
+                && entry.fetched_at.elapsed() < CATALOGUE_TTL
+            {
+                return match &entry.state {
+                    CatalogueState::Ready(ids) => Some(ids.clone()),
+                    CatalogueState::Unavailable => None,
+                };
             }
         }
 
-        if is_siwc_model(&original_model) {
+        let url = format!("{}/models", direct.base_url.trim_end_matches('/'));
+        let mut req = self.http.get(&url).timeout(CATALOGUE_TIMEOUT);
+        if let Some(key) = direct.api_key_at(key_index) {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+
+        let state = match req.send().await {
+            Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                Ok(body) => {
+                    let ids: Vec<String> = body
+                        .get("data")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| {
+                                    item.get("id").and_then(Value::as_str).map(str::to_owned)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if ids.is_empty() {
+                        tracing::debug!(
+                            provider = %direct.provider_name,
+                            key_index = key_index,
+                            "direct provider model catalogue is empty; dispatching without validation"
+                        );
+                        CatalogueState::Unavailable
+                    } else {
+                        CatalogueState::Ready(Arc::new(ids))
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        provider = %direct.provider_name,
+                        key_index = key_index,
+                        error = %err,
+                        "direct provider model catalogue is unreadable; dispatching without validation"
+                    );
+                    CatalogueState::Unavailable
+                }
+            },
+            Ok(resp) => {
+                tracing::warn!(
+                    provider = %direct.provider_name,
+                    key_index = key_index,
+                    upstream_status = resp.status().as_u16(),
+                    "direct provider model catalogue returned a non-200; dispatching without validation"
+                );
+                CatalogueState::Unavailable
+            }
+            Err(err) => {
+                tracing::warn!(
+                    provider = %direct.provider_name,
+                    key_index = key_index,
+                    error = %err,
+                    "direct provider model catalogue is unreachable; dispatching without validation"
+                );
+                CatalogueState::Unavailable
+            }
+        };
+
+        let resolved = match &state {
+            CatalogueState::Ready(ids) => Some(ids.clone()),
+            CatalogueState::Unavailable => None,
+        };
+        self.model_catalogues.write().await.insert(
+            cache_key,
+            CatalogueEntry {
+                state,
+                fetched_at: Instant::now(),
+            },
+        );
+        resolved
+    }
+
+    /// Reject a sub-model that the direct provider's catalogue does not list.
+    ///
+    /// When the catalogue cannot be fetched the model is forwarded unchecked, so a catalogue
+    /// outage degrades to the previous behaviour instead of failing requests.
+    async fn validate_direct_provider_model(
+        &self,
+        direct: &DirectProviderAccount,
+        key_index: usize,
+        requested_model: &str,
+        base_model: &str,
+    ) -> Result<()> {
+        // An empty or `default` sub-model means "let the provider choose".
+        if base_model.is_empty() || base_model.eq_ignore_ascii_case("default") {
+            return Ok(());
+        }
+        let Some(ids) = self.direct_provider_models(direct, key_index).await else {
+            return Ok(());
+        };
+        if ids.iter().any(|id| id.eq_ignore_ascii_case(base_model)) {
+            return Ok(());
+        }
+        // The prefix is a registered provider here, so report the sub-model, not the prefix.
+        Err(ModelResolutionError::SubModelNotFound {
+            provider: direct.provider_name.clone(),
+            model: requested_model.to_string(),
+        }
+        .into())
+    }
+
+    /// Name the backend that serves `model`, without dispatching a request.
+    ///
+    /// The HTTP layer uses this so its logs name the same route the dispatch path takes.
+    /// An unregistered prefix is reported verbatim, which is how a rejected model appears
+    /// in the log line that explains the failure.
+    pub async fn resolve_provider_name(&self, model: &str) -> String {
+        let (prefix, _) = strip_model_prefix(model);
+        if let Some(p) = prefix {
+            let providers = self.direct_providers.read().await;
+            if let Some((name, _)) = providers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(p))
+            {
+                return name.clone();
+            }
+            return p.to_string();
+        }
+        if is_siwc_model(model) {
+            return "chatgpt".to_string();
+        }
+        if self.antigravity_accounts.read().await.is_empty() {
+            // The dispatch path falls back to the first direct provider in this case.
+            if let Some((name, _)) = self.direct_providers.read().await.iter().next() {
+                return name.clone();
+            }
+        }
+        "agy".to_string()
+    }
+
+    /// Dispatch a non-streaming chat completion and trace the routing decision.
+    ///
+    /// A model prefix that names neither a registered direct provider nor a built-in backend
+    /// is rejected with [`ModelResolutionError::ModelNotFound`] instead of falling through to
+    /// an unrelated upstream.
+    pub async fn chat_completion(&self, input: ChatRequest) -> Result<ChatResponse> {
+        let started = std::time::Instant::now();
+        let requested_model = input.model.trim().to_string();
+        let mut trace = ChatDispatchTrace {
+            provider: self.resolve_provider_name(&requested_model).await,
+            resolved_model: resolve_upstream_model_id(&requested_model),
+            requested_model,
+            upstream_status: None,
+        };
+
+        let result = self.dispatch_chat_completion(input, &mut trace).await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        match &result {
+            Ok(resp) => tracing::info!(
+                provider = %trace.provider,
+                requested_model = %trace.requested_model,
+                upstream_model = %trace.resolved_model,
+                response_model = %resp.model,
+                upstream_status = ?trace.upstream_status,
+                elapsed_ms = elapsed_ms,
+                "chat completion succeeded"
+            ),
+            Err(err) => tracing::warn!(
+                provider = %trace.provider,
+                requested_model = %trace.requested_model,
+                upstream_model = %trace.resolved_model,
+                upstream_status = ?trace.upstream_status,
+                elapsed_ms = elapsed_ms,
+                error = %err,
+                "chat completion failed"
+            ),
+        }
+
+        result
+    }
+
+    async fn dispatch_chat_completion(
+        &self,
+        mut input: ChatRequest,
+        trace: &mut ChatDispatchTrace,
+    ) -> Result<ChatResponse> {
+        let requested_model = trace.requested_model.clone();
+        let (prefix, base_model) = strip_model_prefix(&requested_model);
+        input.model = trace.resolved_model.clone();
+
+        // Check if explicitly matching a direct provider (e.g. opencode/gpt-5.6-luna)
+        if let Some(p) = prefix {
+            let direct = {
+                let providers = self.direct_providers.read().await;
+                find_direct_provider(&providers, p)
+            };
+            if let Some(direct) = direct {
+                // Claim the key index first so the catalogue check and the dispatch agree,
+                // and so rotating keys never share a catalogue entry.
+                let key_index = direct.next_key_index();
+                self.validate_direct_provider_model(
+                    &direct,
+                    key_index,
+                    &requested_model,
+                    &base_model,
+                )
+                .await?;
+                input.model = base_model;
+                trace.resolved_model = input.model.clone();
+                return match execute_direct_provider_non_stream(
+                    &self.http,
+                    &direct,
+                    key_index,
+                    &input,
+                )
+                .await
+                {
+                    Ok(resp) => {
+                        // A non-2xx status returns early as an error, so this is the success code.
+                        trace.upstream_status = Some(200);
+                        Ok(resp)
+                    }
+                    Err(err) => {
+                        trace.upstream_status = upstream_status_of(&err);
+                        Err(err)
+                    }
+                };
+            }
+            // Reject an unknown prefix before any backend is chosen. Falling through here is
+            // what made a nonexistent model look like an unrelated provider failure.
+            if !is_builtin_model_prefix(p) {
+                return Err(ModelResolutionError::ModelNotFound {
+                    prefix: p.to_string(),
+                    model: requested_model.clone(),
+                }
+                .into());
+            }
+        }
+
+        if is_siwc_model(&requested_model) {
             let siwcs = self.siwc_accounts.read().await;
             if siwcs.is_empty() {
                 return Err(anyhow!("No SIWC accounts available"));
@@ -260,7 +648,14 @@ impl LlmProviderClient {
             // Check direct providers fallback if model matches
             let directs = self.direct_providers.read().await;
             if let Some(direct) = directs.values().next() {
-                return execute_direct_provider_non_stream(&self.http, direct, &input).await;
+                let key_index = direct.next_key_index();
+                return execute_direct_provider_non_stream(
+                    &self.http,
+                    direct,
+                    key_index,
+                    &input,
+                )
+                .await;
             }
             return Err(anyhow!("No Antigravity accounts available"));
         }
@@ -274,14 +669,35 @@ impl LlmProviderClient {
         mut input: ChatRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>> {
         let original_model = input.model.clone();
-        let (prefix, base_model) = crate::resolver::strip_model_prefix(&original_model);
+        let (prefix, base_model) = strip_model_prefix(&original_model);
         input.model = resolve_upstream_model_id(&original_model);
 
         if let Some(p) = prefix {
-            let directs = self.direct_providers.read().await;
-            if let Some(direct) = directs.get(p) {
+            let direct = {
+                let providers = self.direct_providers.read().await;
+                find_direct_provider(&providers, p)
+            };
+            if let Some(direct) = direct {
+                // Same catalogue check as the non-stream path: an unknown sub-model is a 404,
+                // not an upstream 400 dressed up as a 502.
+                let key_index = direct.next_key_index();
+                self.validate_direct_provider_model(
+                    &direct,
+                    key_index,
+                    &original_model,
+                    &base_model,
+                )
+                .await?;
                 input.model = base_model;
-                return execute_direct_provider_stream(&self.http, direct, &input).await;
+                return execute_direct_provider_stream(&self.http, &direct, key_index, &input)
+                    .await;
+            }
+            if !is_builtin_model_prefix(p) {
+                return Err(ModelResolutionError::ModelNotFound {
+                    prefix: p.to_string(),
+                    model: original_model.clone(),
+                }
+                .into());
             }
         }
 
@@ -299,7 +715,8 @@ impl LlmProviderClient {
         if ags.is_empty() {
             let directs = self.direct_providers.read().await;
             if let Some(direct) = directs.values().next() {
-                return execute_direct_provider_stream(&self.http, direct, &input).await;
+                let key_index = direct.next_key_index();
+                return execute_direct_provider_stream(&self.http, direct, key_index, &input).await;
             }
             return Err(anyhow!("No Antigravity accounts available"));
         }
@@ -979,9 +1396,58 @@ pub async fn execute_siwc_stream(
     Ok(Box::pin(full_stream))
 }
 
+/// Session id to send upstream for this request.
+///
+/// The inbound client value wins so a conversation keeps one id end to end; a request that
+/// carried none gets a generated one, since OpenCode Go rejects a missing session header.
+fn session_id_for(input: &ChatRequest) -> String {
+    input
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(new_session_id)
+}
+
+/// Generate a session id for a request that carried none.
+///
+/// OpenCode Go accepts any opaque value, so a UUID v4 keeps callers that cannot send the
+/// header (curl, internal callers) working without tracking conversation state.
+fn new_session_id() -> String {
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5],
+        b[6],
+        b[7],
+        b[8],
+        b[9],
+        b[10],
+        b[11],
+        b[12],
+        b[13],
+        b[14],
+        b[15]
+    )
+}
+
+/// Send a non-streaming completion to a direct provider using a pre-claimed key index.
+///
+/// The caller claims the index first so the catalogue check and this dispatch authenticate
+/// with the same key.
 pub async fn execute_direct_provider_non_stream(
     http: &reqwest::Client,
     direct: &DirectProviderAccount,
+    key_index: usize,
     input: &ChatRequest,
 ) -> Result<ChatResponse> {
     let url = format!("{}/chat/completions", direct.base_url.trim_end_matches('/'));
@@ -989,17 +1455,21 @@ pub async fn execute_direct_provider_non_stream(
         .post(&url)
         .header("User-Agent", "opencode/1.0.0")
         .json(input);
-    if !direct.api_keys.is_empty() {
-        let idx = direct.next_key_idx.fetch_add(1, Ordering::Relaxed) % direct.api_keys.len();
-        let key = &direct.api_keys[idx];
-        if !key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", key));
-        }
+    if let Some(key) = direct.api_key_at(key_index) {
+        req = req.header("Authorization", format!("Bearer {}", key));
+    }
+    if let Some(header) = &direct.session_header {
+        req = req.header(header.as_str(), session_id_for(input));
     }
     let resp = req.send().await?;
     if !resp.status().is_success() {
+        let status = resp.status().as_u16();
         let err_text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("Direct provider upstream error: {}", err_text));
+        return Err(UpstreamStatusError {
+            status,
+            body: err_text,
+        }
+        .into());
     }
     let chat_resp = resp.json::<ChatResponse>().await?;
     Ok(chat_resp)
@@ -1008,6 +1478,7 @@ pub async fn execute_direct_provider_non_stream(
 pub async fn execute_direct_provider_stream(
     http: &reqwest::Client,
     direct: &DirectProviderAccount,
+    key_index: usize,
     input: &ChatRequest,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>> {
     let url = format!("{}/chat/completions", direct.base_url.trim_end_matches('/'));
@@ -1015,17 +1486,21 @@ pub async fn execute_direct_provider_stream(
         .post(&url)
         .header("User-Agent", "opencode/1.0.0")
         .json(input);
-    if !direct.api_keys.is_empty() {
-        let idx = direct.next_key_idx.fetch_add(1, Ordering::Relaxed) % direct.api_keys.len();
-        let key = &direct.api_keys[idx];
-        if !key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", key));
-        }
+    if let Some(key) = direct.api_key_at(key_index) {
+        req = req.header("Authorization", format!("Bearer {}", key));
+    }
+    if let Some(header) = &direct.session_header {
+        req = req.header(header.as_str(), session_id_for(input));
     }
     let resp = req.send().await?;
     if !resp.status().is_success() {
+        let status = resp.status().as_u16();
         let err_text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("Direct provider upstream error: {}", err_text));
+        return Err(UpstreamStatusError {
+            status,
+            body: err_text,
+        }
+        .into());
     }
     let data_stream = sse_data_stream(resp.bytes_stream());
     let parsed = data_stream.filter_map(|payload_res| async move {
@@ -1354,5 +1829,370 @@ mod usage_stream_tests {
             let parsed: ChatRequest = serde_json::from_value(request).unwrap();
             assert_eq!(requests_usage(&parsed), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod direct_provider_catalogue_tests {
+    use super::*;
+    use tiny_http::{Header, Response, Server};
+
+    const CATALOGUE_BODY: &str =
+        r#"{"object":"list","data":[{"id":"known-model"},{"id":"second-model"}]}"#;
+
+    const COMPLETION_BODY: &str = r#"{"id":"chatcmpl-stub","object":"chat.completion","created":0,"model":"known-model","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+
+    /// Start a stub direct provider and return its base url.
+    ///
+    /// `catalogue_status` lets a test simulate a catalogue outage while completions still
+    /// answer, which is the case that must fall through to dispatch.
+    fn spawn_provider(catalogue_status: u16) -> String {
+        let server = Server::http("127.0.0.1:0").expect("bind stub provider");
+        let base = format!(
+            "http://{}",
+            server.server_addr().to_ip().expect("stub provider ip")
+        );
+        std::thread::spawn(move || {
+            let json_header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                .expect("content type header");
+            for request in server.incoming_requests() {
+                let url = request.url().to_string();
+                let (status, body) = if url.starts_with("/models") {
+                    (catalogue_status, CATALOGUE_BODY)
+                } else if url.starts_with("/chat/completions") {
+                    (200, COMPLETION_BODY)
+                } else {
+                    (404, "{}")
+                };
+                let response = Response::from_string(body)
+                    .with_status_code(status)
+                    .with_header(json_header.clone());
+                let _ = request.respond(response);
+            }
+        });
+        base
+    }
+
+    async fn client_with_provider(name: &str, base: String) -> LlmProviderClient {
+        let client = LlmProviderClient::new();
+        client
+            .add_direct_provider(name.to_string(), base, vec!["test-key".to_string()], None)
+            .await;
+        client
+    }
+
+    fn request(model: &str) -> ChatRequest {
+        serde_json::from_value(json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "ping" }]
+        }))
+        .expect("build chat request")
+    }
+
+    #[tokio::test]
+    async fn unknown_sub_model_under_registered_provider_is_reported_missing() {
+        let base = spawn_provider(200);
+        let client = client_with_provider("composync", base).await;
+
+        let err = client
+            .chat_completion(request("composync/does-not-exist-model"))
+            .await
+            .expect_err("an unlisted sub-model must be rejected locally");
+
+        match err.downcast_ref::<ModelResolutionError>() {
+            Some(ModelResolutionError::SubModelNotFound { provider, model }) => {
+                assert_eq!(provider, "composync");
+                assert_eq!(model, "composync/does-not-exist-model");
+            }
+            _ => panic!("expected SubModelNotFound, got: {err}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn listed_sub_model_is_dispatched() {
+        let base = spawn_provider(200);
+        let client = client_with_provider("composync", base).await;
+
+        let resp = client
+            .chat_completion(request("composync/known-model"))
+            .await
+            .expect("a listed sub-model must reach the provider");
+        assert_eq!(resp.model, "known-model");
+    }
+
+    #[tokio::test]
+    async fn unavailable_catalogue_falls_back_to_dispatch() {
+        let base = spawn_provider(500);
+        let client = client_with_provider("composync", base).await;
+
+        let resp = client
+            .chat_completion(request("composync/does-not-exist-model"))
+            .await
+            .expect("a catalogue outage must not block dispatch");
+        assert_eq!(resp.model, "known-model");
+    }
+
+    #[test]
+    fn catalogue_cache_is_keyed_per_provider_and_key_index() {
+        let key_a = CatalogueKey {
+            provider: "composync".to_string(),
+            key_index: 0,
+        };
+        let key_b = CatalogueKey {
+            provider: "composync".to_string(),
+            key_index: 1,
+        };
+        let key_c = CatalogueKey {
+            provider: "opencode".to_string(),
+            key_index: 0,
+        };
+        let mut entries: HashMap<CatalogueKey, CatalogueEntry> = HashMap::new();
+        entries.insert(
+            key_a.clone(),
+            CatalogueEntry {
+                state: CatalogueState::Ready(Arc::new(vec!["known-model".to_string()])),
+                fetched_at: Instant::now(),
+            },
+        );
+        assert!(matches!(
+            entries.get(&key_a).map(|e| &e.state),
+            Some(CatalogueState::Ready(_))
+        ));
+        // A rotated key or a different provider must not read the first catalogue.
+        assert!(entries.get(&key_b).is_none());
+        assert!(entries.get(&key_c).is_none());
+    }
+
+    #[test]
+    fn upstream_model_faults_are_recognized() {
+        let live_composync_body = r#"{"error":{"message":"Unable to determine provider for model 'does-not-exist-model'.","type":"invalid_request_error","code":"bad_request"}}"#;
+        let cases = [
+            (
+                400,
+                live_composync_body,
+                true,
+                "the live composync wording",
+            ),
+            (
+                404,
+                r#"{"error":{"message":"The model `nope` does not exist or you do not have access to it."}}"#,
+                true,
+                "the OpenAI wording",
+            ),
+            (
+                400,
+                r#"{"error":{"message":"messages: at least one message is required"}}"#,
+                false,
+                "a malformed messages array",
+            ),
+            (
+                400,
+                r#"{"error":{"message":"This model's maximum context length is 8192 tokens, however you requested 9000 tokens."}}"#,
+                false,
+                "a token-limit violation",
+            ),
+            (
+                400,
+                r#"{"error":{"message":"invalid model parameters: temperature must be <= 2"}}"#,
+                false,
+                "generic model parameters",
+            ),
+            (
+                503,
+                r#"{"error":{"message":"unknown model backend"}}"#,
+                false,
+                "a server fault that mentions a model",
+            ),
+        ];
+        for (status, body, expected, label) in cases {
+            let err = UpstreamStatusError {
+                status,
+                body: body.to_string(),
+            };
+            assert_eq!(err.reports_unknown_model(), expected, "case: {label}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod direct_provider_session_header_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tiny_http::{Header, Response, Server};
+
+    const SESSION_HEADER: &str = "x-opencode-session";
+
+    const COMPLETION_BODY: &str = r#"{"id":"chatcmpl-stub","object":"chat.completion","created":0,"model":"known-model","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+
+    /// Session header values the stub provider saw, one entry per chat completion.
+    type Captured = Arc<Mutex<Vec<Option<String>>>>;
+
+    /// Start a stub direct provider that records the session header of every completion.
+    ///
+    /// `/models` answers 404 so the catalogue check falls through to dispatch, which is the
+    /// path under test here.
+    fn spawn_provider(captured: Captured) -> String {
+        let server = Server::http("127.0.0.1:0").expect("bind stub provider");
+        let base = format!(
+            "http://{}",
+            server.server_addr().to_ip().expect("stub provider ip")
+        );
+        std::thread::spawn(move || {
+            let json_header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                .expect("content type header");
+            for request in server.incoming_requests() {
+                let url = request.url().to_string();
+                if url.starts_with("/models") {
+                    let _ = request.respond(
+                        Response::from_string("{}")
+                            .with_status_code(404)
+                            .with_header(json_header.clone()),
+                    );
+                    continue;
+                }
+                let seen = request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv(SESSION_HEADER))
+                    .map(|h| h.value.as_str().to_string());
+                captured.lock().expect("capture lock").push(seen);
+                let _ = request.respond(
+                    Response::from_string(COMPLETION_BODY)
+                        .with_status_code(200)
+                        .with_header(json_header.clone()),
+                );
+            }
+        });
+        base
+    }
+
+    async fn client_with_provider(
+        base: String,
+        session_header: Option<String>,
+    ) -> LlmProviderClient {
+        let client = LlmProviderClient::new();
+        client
+            .add_direct_provider(
+                "session-provider".to_string(),
+                base,
+                vec!["test-key".to_string()],
+                session_header,
+            )
+            .await;
+        client
+    }
+
+    fn request(model: &str) -> ChatRequest {
+        serde_json::from_value(json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "ping" }]
+        }))
+        .expect("build chat request")
+    }
+
+    /// Shape check for a canonical UUID v4: 36 characters, dashes at the fixed offsets, a
+    /// version nibble of 4 and a variant nibble of 8, 9, a or b.
+    fn is_uuid_v4(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        if bytes.len() != 36 {
+            return false;
+        }
+        for offset in [8, 13, 18, 23] {
+            if bytes[offset] != b'-' {
+                return false;
+            }
+        }
+        let hex_ok = value
+            .char_indices()
+            .all(|(i, c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit());
+        hex_ok && bytes[14] == b'4' && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+    }
+
+    fn captured_values(captured: &Captured) -> Vec<Option<String>> {
+        captured.lock().expect("capture lock").clone()
+    }
+
+    #[tokio::test]
+    async fn inbound_session_id_reaches_the_provider() {
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let base = spawn_provider(captured.clone());
+        let client = client_with_provider(base, Some(SESSION_HEADER.to_string())).await;
+
+        let mut input = request("session-provider/known-model");
+        input.session_id = Some("abc-123".to_string());
+        let resp = client
+            .chat_completion(input)
+            .await
+            .expect("completion must reach the stub provider");
+        assert_eq!(resp.model, "known-model");
+
+        assert_eq!(
+            captured_values(&captured),
+            vec![Some("abc-123".to_string())],
+            "the inbound session id must be forwarded verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_session_id_is_generated_as_uuid_v4() {
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let base = spawn_provider(captured.clone());
+        let client = client_with_provider(base, Some(SESSION_HEADER.to_string())).await;
+
+        let input = request("session-provider/known-model");
+        assert!(input.session_id.is_none());
+        let stream = client
+            .chat_completion_stream(input)
+            .await
+            .expect("stream dispatch must reach the stub provider");
+        drop(stream);
+
+        let seen = captured_values(&captured);
+        assert_eq!(seen.len(), 1, "one completion must produce one capture");
+        let value = seen[0].clone().expect("the session header must be present");
+        assert!(
+            is_uuid_v4(&value),
+            "a generated session id must be a canonical uuid v4, got: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_without_session_header_sends_none() {
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let base = spawn_provider(captured.clone());
+        let client = client_with_provider(base, None).await;
+
+        let mut input = request("session-provider/known-model");
+        input.session_id = Some("abc-123".to_string());
+        client
+            .chat_completion(input)
+            .await
+            .expect("completion must reach the stub provider");
+
+        assert_eq!(
+            captured_values(&captured),
+            vec![None],
+            "a provider that does not ask for a session header must not receive one"
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_session_header_name_degrades_to_no_header() {
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let base = spawn_provider(captured.clone());
+        let client = client_with_provider(base, Some("   ".to_string())).await;
+
+        let mut input = request("session-provider/known-model");
+        input.session_id = Some("abc-123".to_string());
+        client
+            .chat_completion(input)
+            .await
+            .expect("a blank header name must not panic the dispatch path");
+
+        assert_eq!(
+            captured_values(&captured),
+            vec![None],
+            "a whitespace-only header name must be treated as absent"
+        );
     }
 }

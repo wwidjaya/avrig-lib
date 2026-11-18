@@ -1,3 +1,25 @@
+/// Prefixes the gateway routes without a registered direct provider.
+///
+/// Any other prefix must either name a configured direct provider or be rejected: it must
+/// never fall through to a different backend, because that turns a bad model name into an
+/// unrelated upstream failure.
+pub const BUILTIN_MODEL_PREFIXES: &[&str] = &["chatgpt", "agy", "antigravity", "opencode", "ollama"];
+
+/// Model resolution failures that belong to the caller, not to an upstream.
+#[derive(Debug, thiserror::Error)]
+pub enum ModelResolutionError {
+    #[error("Unknown model prefix '{prefix}' for model '{model}'")]
+    ModelNotFound { prefix: String, model: String },
+    #[error("Provider '{provider}' does not offer model '{model}'")]
+    SubModelNotFound { provider: String, model: String },
+}
+
+pub fn is_builtin_model_prefix(prefix: &str) -> bool {
+    BUILTIN_MODEL_PREFIXES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(prefix))
+}
+
 pub fn strip_model_prefix(model: &str) -> (Option<&str>, String) {
     let m = model.trim();
     if let Some(idx) = m.rfind('/') {
@@ -98,6 +120,34 @@ mod tests {
         assert_eq!(
             strip_model_prefix("gemini-2.5-flash"),
             (None, "gemini-2.5-flash".to_string())
+        );
+    }
+
+    #[test]
+    fn builtin_prefixes_match_the_resolver_special_cases() {
+        for known in ["chatgpt", "CHATGPT", "agy", "Antigravity", "opencode", "ollama"] {
+            assert!(
+                is_builtin_model_prefix(known),
+                "{known} must be treated as built in"
+            );
+        }
+        for unknown in ["composync", "groq", "google", ""] {
+            assert!(
+                !is_builtin_model_prefix(unknown),
+                "{unknown} must not be treated as built in"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_prefix_reports_prefix_and_model() {
+        let err = ModelResolutionError::ModelNotFound {
+            prefix: "composync".to_string(),
+            model: "composync/paid".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "Unknown model prefix 'composync' for model 'composync/paid'"
         );
     }
 
