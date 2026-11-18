@@ -46,6 +46,9 @@ pub struct DirectProviderAccount {
     pub next_key_idx: Arc<AtomicUsize>,
     /// Header name that carries a session id on every chat completion, when the upstream wants one.
     pub session_header: Option<String>,
+    /// Outbound User-Agent policy: unset keeps the gateway default, `{forward}` passes the
+    /// caller's application agent through, and any other value is sent verbatim.
+    pub user_agent: Option<String>,
 }
 
 impl DirectProviderAccount {
@@ -228,6 +231,7 @@ impl LlmProviderClient {
         base_url: String,
         api_keys: Vec<String>,
         session_header: Option<String>,
+        user_agent: Option<String>,
     ) {
         // A blank or malformed header name is a configuration typo, and reqwest panics on an
         // invalid header name on every request, so an unusable name degrades to "no session
@@ -235,6 +239,16 @@ impl LlmProviderClient {
         let session_header = session_header
             .map(|name| name.trim().to_string())
             .filter(|name| reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_ok());
+        // A blank user agent policy means "keep the gateway default", same as absent. A literal
+        // that cannot be sent as a header value would panic per request, so it is treated as
+        // absent too; the `{forward}` sentinel is not a header value and is kept as written.
+        let user_agent = user_agent
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .filter(|value| {
+                value == FORWARD_USER_AGENT
+                    || reqwest::header::HeaderValue::try_from(value.as_str()).is_ok()
+            });
         let mut map = self.direct_providers.write().await;
         map.insert(
             provider_name.clone(),
@@ -244,6 +258,7 @@ impl LlmProviderClient {
                 api_keys,
                 next_key_idx: Arc::new(AtomicUsize::new(0)),
                 session_header,
+                user_agent,
             },
         );
     }
@@ -1440,6 +1455,72 @@ fn new_session_id() -> String {
     )
 }
 
+/// User agent the gateway sends to a direct provider unless the caller's own is forwarded.
+const DEFAULT_USER_AGENT: &str = "opencode/1.0.0";
+
+/// Policy value that passes the caller's own user agent through instead of a fixed string.
+const FORWARD_USER_AGENT: &str = "{forward}";
+
+/// Caller user agent, when it identifies an application rather than an HTTP library.
+///
+/// OpenCode Go asks clients to identify themselves and monitors traffic for abuse, so common
+/// library agent strings (curl, python-requests, reqwest, and similar) are replaced by the
+/// gateway's own default instead of being forwarded.
+fn application_user_agent(value: &str) -> Option<&str> {
+    const GENERIC: &[&str] = &[
+        "curl/",
+        "wget/",
+        "python",
+        "reqwest/",
+        "node",
+        "axios/",
+        "okhttp/",
+        "go-http-client/",
+        "java/",
+        "powershell/",
+        "mozilla/",
+        "httpie/",
+        "postmanruntime/",
+        "insomnia/",
+        "undici/",
+        "deno/",
+        "bun/",
+        "hyper/",
+        "libwww-perl",
+        "httpclient/",
+        "guzzlehttp/",
+        "faraday",
+        "restsharp",
+    ];
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    if GENERIC.iter().any(|prefix| lowered.starts_with(prefix)) {
+        return None;
+    }
+    Some(trimmed)
+}
+
+/// User-Agent header value for a direct provider request.
+///
+/// `None` keeps the gateway default, `{forward}` passes the caller's agent through when it
+/// identifies an application, and any other configured value is sent as written.
+fn user_agent_for<'a>(direct: &'a DirectProviderAccount, input: &'a ChatRequest) -> &'a str {
+    let Some(policy) = direct.user_agent.as_deref() else {
+        return DEFAULT_USER_AGENT;
+    };
+    if policy == FORWARD_USER_AGENT {
+        return input
+            .user_agent
+            .as_deref()
+            .and_then(application_user_agent)
+            .unwrap_or(DEFAULT_USER_AGENT);
+    }
+    policy
+}
+
 /// Send a non-streaming completion to a direct provider using a pre-claimed key index.
 ///
 /// The caller claims the index first so the catalogue check and this dispatch authenticate
@@ -1453,7 +1534,7 @@ pub async fn execute_direct_provider_non_stream(
     let url = format!("{}/chat/completions", direct.base_url.trim_end_matches('/'));
     let mut req = http
         .post(&url)
-        .header("User-Agent", "opencode/1.0.0")
+        .header("User-Agent", user_agent_for(direct, input))
         .json(input);
     if let Some(key) = direct.api_key_at(key_index) {
         req = req.header("Authorization", format!("Bearer {}", key));
@@ -1484,7 +1565,7 @@ pub async fn execute_direct_provider_stream(
     let url = format!("{}/chat/completions", direct.base_url.trim_end_matches('/'));
     let mut req = http
         .post(&url)
-        .header("User-Agent", "opencode/1.0.0")
+        .header("User-Agent", user_agent_for(direct, input))
         .json(input);
     if let Some(key) = direct.api_key_at(key_index) {
         req = req.header("Authorization", format!("Bearer {}", key));
@@ -1876,7 +1957,13 @@ mod direct_provider_catalogue_tests {
     async fn client_with_provider(name: &str, base: String) -> LlmProviderClient {
         let client = LlmProviderClient::new();
         client
-            .add_direct_provider(name.to_string(), base, vec!["test-key".to_string()], None)
+            .add_direct_provider(
+                name.to_string(),
+                base,
+                vec!["test-key".to_string()],
+                None,
+                None,
+            )
             .await;
         client
     }
@@ -2022,12 +2109,30 @@ mod direct_provider_session_header_tests {
 
     const SESSION_HEADER: &str = "x-opencode-session";
 
+    const USER_AGENT_HEADER: &str = "user-agent";
+
     const COMPLETION_BODY: &str = r#"{"id":"chatcmpl-stub","object":"chat.completion","created":0,"model":"known-model","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
 
-    /// Session header values the stub provider saw, one entry per chat completion.
-    type Captured = Arc<Mutex<Vec<Option<String>>>>;
+    /// Headers the stub provider saw on one chat completion.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct SeenHeaders {
+        session: Option<String>,
+        user_agent: Option<String>,
+    }
 
-    /// Start a stub direct provider that records the session header of every completion.
+    /// One capture per chat completion the stub provider answered.
+    type Captured = Arc<Mutex<Vec<SeenHeaders>>>;
+
+    fn header_value(request: &tiny_http::Request, name: &'static str) -> Option<String> {
+        request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv(name))
+            .map(|h| h.value.as_str().to_string())
+    }
+
+    /// Start a stub direct provider that records the session and user-agent headers of every
+    /// completion.
     ///
     /// `/models` answers 404 so the catalogue check falls through to dispatch, which is the
     /// path under test here.
@@ -2050,11 +2155,10 @@ mod direct_provider_session_header_tests {
                     );
                     continue;
                 }
-                let seen = request
-                    .headers()
-                    .iter()
-                    .find(|h| h.field.equiv(SESSION_HEADER))
-                    .map(|h| h.value.as_str().to_string());
+                let seen = SeenHeaders {
+                    session: header_value(&request, SESSION_HEADER),
+                    user_agent: header_value(&request, USER_AGENT_HEADER),
+                };
                 captured.lock().expect("capture lock").push(seen);
                 let _ = request.respond(
                     Response::from_string(COMPLETION_BODY)
@@ -2069,6 +2173,7 @@ mod direct_provider_session_header_tests {
     async fn client_with_provider(
         base: String,
         session_header: Option<String>,
+        user_agent: Option<String>,
     ) -> LlmProviderClient {
         let client = LlmProviderClient::new();
         client
@@ -2077,6 +2182,7 @@ mod direct_provider_session_header_tests {
                 base,
                 vec!["test-key".to_string()],
                 session_header,
+                user_agent,
             )
             .await;
         client
@@ -2108,7 +2214,7 @@ mod direct_provider_session_header_tests {
         hex_ok && bytes[14] == b'4' && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
     }
 
-    fn captured_values(captured: &Captured) -> Vec<Option<String>> {
+    fn captured_values(captured: &Captured) -> Vec<SeenHeaders> {
         captured.lock().expect("capture lock").clone()
     }
 
@@ -2116,7 +2222,7 @@ mod direct_provider_session_header_tests {
     async fn inbound_session_id_reaches_the_provider() {
         let captured: Captured = Arc::new(Mutex::new(Vec::new()));
         let base = spawn_provider(captured.clone());
-        let client = client_with_provider(base, Some(SESSION_HEADER.to_string())).await;
+        let client = client_with_provider(base, Some(SESSION_HEADER.to_string()), None).await;
 
         let mut input = request("session-provider/known-model");
         input.session_id = Some("abc-123".to_string());
@@ -2126,9 +2232,11 @@ mod direct_provider_session_header_tests {
             .expect("completion must reach the stub provider");
         assert_eq!(resp.model, "known-model");
 
+        let seen = captured_values(&captured);
+        assert_eq!(seen.len(), 1, "one completion must produce one capture");
         assert_eq!(
-            captured_values(&captured),
-            vec![Some("abc-123".to_string())],
+            seen[0].session.as_deref(),
+            Some("abc-123"),
             "the inbound session id must be forwarded verbatim"
         );
     }
@@ -2137,7 +2245,7 @@ mod direct_provider_session_header_tests {
     async fn missing_session_id_is_generated_as_uuid_v4() {
         let captured: Captured = Arc::new(Mutex::new(Vec::new()));
         let base = spawn_provider(captured.clone());
-        let client = client_with_provider(base, Some(SESSION_HEADER.to_string())).await;
+        let client = client_with_provider(base, Some(SESSION_HEADER.to_string()), None).await;
 
         let input = request("session-provider/known-model");
         assert!(input.session_id.is_none());
@@ -2149,9 +2257,12 @@ mod direct_provider_session_header_tests {
 
         let seen = captured_values(&captured);
         assert_eq!(seen.len(), 1, "one completion must produce one capture");
-        let value = seen[0].clone().expect("the session header must be present");
+        let value = seen[0]
+            .session
+            .as_deref()
+            .expect("the session header must be present");
         assert!(
-            is_uuid_v4(&value),
+            is_uuid_v4(value),
             "a generated session id must be a canonical uuid v4, got: {value}"
         );
     }
@@ -2160,7 +2271,7 @@ mod direct_provider_session_header_tests {
     async fn provider_without_session_header_sends_none() {
         let captured: Captured = Arc::new(Mutex::new(Vec::new()));
         let base = spawn_provider(captured.clone());
-        let client = client_with_provider(base, None).await;
+        let client = client_with_provider(base, None, None).await;
 
         let mut input = request("session-provider/known-model");
         input.session_id = Some("abc-123".to_string());
@@ -2169,9 +2280,10 @@ mod direct_provider_session_header_tests {
             .await
             .expect("completion must reach the stub provider");
 
-        assert_eq!(
-            captured_values(&captured),
-            vec![None],
+        let seen = captured_values(&captured);
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].session.is_none(),
             "a provider that does not ask for a session header must not receive one"
         );
     }
@@ -2180,7 +2292,7 @@ mod direct_provider_session_header_tests {
     async fn blank_session_header_name_degrades_to_no_header() {
         let captured: Captured = Arc::new(Mutex::new(Vec::new()));
         let base = spawn_provider(captured.clone());
-        let client = client_with_provider(base, Some("   ".to_string())).await;
+        let client = client_with_provider(base, Some("   ".to_string()), None).await;
 
         let mut input = request("session-provider/known-model");
         input.session_id = Some("abc-123".to_string());
@@ -2189,10 +2301,99 @@ mod direct_provider_session_header_tests {
             .await
             .expect("a blank header name must not panic the dispatch path");
 
-        assert_eq!(
-            captured_values(&captured),
-            vec![None],
+        let seen = captured_values(&captured);
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].session.is_none(),
             "a whitespace-only header name must be treated as absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_policy_sends_the_callers_application_agent() {
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let base = spawn_provider(captured.clone());
+        let client = client_with_provider(base, None, Some(FORWARD_USER_AGENT.to_string())).await;
+
+        let mut input = request("session-provider/known-model");
+        input.user_agent = Some("opencode/1.2.3".to_string());
+        client
+            .chat_completion(input)
+            .await
+            .expect("completion must reach the stub provider");
+
+        let seen = captured_values(&captured);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].user_agent.as_deref(),
+            Some("opencode/1.2.3"),
+            "the {{forward}} policy must pass an application agent through"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_policy_still_blocks_library_agents() {
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let base = spawn_provider(captured.clone());
+        let client = client_with_provider(base, None, Some(FORWARD_USER_AGENT.to_string())).await;
+
+        let mut input = request("session-provider/known-model");
+        input.user_agent = Some("curl/8.9.1".to_string());
+        client
+            .chat_completion(input)
+            .await
+            .expect("completion must reach the stub provider");
+
+        let seen = captured_values(&captured);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].user_agent.as_deref(),
+            Some(DEFAULT_USER_AGENT),
+            "a library user agent must never reach the upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn literal_policy_replaces_the_caller_agent() {
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let base = spawn_provider(captured.clone());
+        let client = client_with_provider(base, None, Some("avrig/0.3.0".to_string())).await;
+
+        let mut input = request("session-provider/known-model");
+        input.user_agent = Some("opencode/1.2.3".to_string());
+        client
+            .chat_completion(input)
+            .await
+            .expect("completion must reach the stub provider");
+
+        let seen = captured_values(&captured);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].user_agent.as_deref(),
+            Some("avrig/0.3.0"),
+            "a literal policy must be sent verbatim whatever the caller sends"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_policy_keeps_the_gateway_default() {
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let base = spawn_provider(captured.clone());
+        let client = client_with_provider(base, None, None).await;
+
+        let mut input = request("session-provider/known-model");
+        input.user_agent = Some("opencode/1.2.3".to_string());
+        client
+            .chat_completion(input)
+            .await
+            .expect("completion must reach the stub provider");
+
+        let seen = captured_values(&captured);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].user_agent.as_deref(),
+            Some(DEFAULT_USER_AGENT),
+            "a provider without a policy keeps the gateway default"
         );
     }
 }

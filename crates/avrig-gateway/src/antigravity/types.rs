@@ -192,6 +192,9 @@ pub struct ChatRequest {
     /// Session id supplied by the calling client. Transport-only, never serialized upstream.
     #[serde(skip)]
     pub session_id: Option<String>,
+    /// Caller User-Agent. Transport-only, never serialized upstream.
+    #[serde(skip)]
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
