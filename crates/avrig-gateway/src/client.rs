@@ -1586,76 +1586,231 @@ pub async fn execute_direct_provider_stream(
     let data_stream = sse_data_stream(resp.bytes_stream());
     let parsed = data_stream.filter_map(|payload_res| async move {
         match payload_res {
-            Ok(data) => serde_json::from_str::<ChatCompletionChunk>(&data)
-                .ok()
-                .map(Ok),
+            Ok(data) => decode_direct_chunk(&data),
             Err(e) => Some(Err(e)),
         }
     });
 
-    let include_usage = requests_usage(input);
-    Ok(filter_direct_usage_stream(parsed, include_usage))
+    Ok(relay_direct_provider_stream(
+        parsed,
+        requests_usage(input),
+        token_cap_of(input),
+        input.model.clone(),
+    ))
 }
 
-fn filter_direct_usage_stream<S>(
+/// Largest upstream frame quoted in a decode-failure log line.
+const MAX_LOGGED_FRAME: usize = 240;
+
+/// Truncate an upstream frame to something a log line can carry.
+fn preview_frame(payload: &str) -> String {
+    match payload.char_indices().nth(MAX_LOGGED_FRAME) {
+        Some((cut, _)) => format!("{}...", &payload[..cut]),
+        None => payload.to_string(),
+    }
+}
+
+/// Decode one upstream SSE payload into a completion chunk.
+///
+/// A payload that is not JSON is a keepalive and is skipped. A payload that is JSON but not a
+/// chunk is skipped with a warning, so a stream that forwards nothing can be explained from the
+/// logs instead of turning into a silent empty response. A payload that reports an error is
+/// returned as an error: an upstream that failed mid-stream must not look like an empty answer.
+fn decode_direct_chunk(payload: &str) -> Option<Result<ChatCompletionChunk>> {
+    let value = match serde_json::from_str::<Value>(payload) {
+        Ok(value) => value,
+        Err(_) => {
+            tracing::debug!(
+                frame = %preview_frame(payload),
+                "skipping a non-JSON direct provider stream frame"
+            );
+            return None;
+        }
+    };
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("upstream reported an error frame");
+        return Some(Err(anyhow!("Direct provider upstream error: {}", message)));
+    }
+    match serde_json::from_value::<ChatCompletionChunk>(value) {
+        Ok(chunk) => Some(Ok(chunk)),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                frame = %preview_frame(payload),
+                "skipping a direct provider stream frame that is not a completion chunk"
+            );
+            None
+        }
+    }
+}
+
+/// Completion length bound the request placed on the upstream, when it set one.
+fn token_cap_of(input: &ChatRequest) -> Option<i64> {
+    [
+        input.max_tokens,
+        input.max_completion_tokens,
+        input.max_output_tokens,
+    ]
+    .into_iter()
+    .flatten()
+    .find(|cap| *cap > 0)
+}
+
+/// Reason to report for a stream the upstream closed without naming one.
+///
+/// A stream that consumed the requested cap was truncated, so it reports `length`. Anything
+/// else ended on its own, so it reports `stop`.
+fn inferred_finish_reason(usage: Option<&OpenAIUsage>, token_cap: Option<i64>) -> String {
+    match (usage, token_cap) {
+        (Some(usage), Some(cap)) if usage.completion_tokens >= cap => "length".to_string(),
+        _ => "stop".to_string(),
+    }
+}
+
+/// Whether a delta carries anything a client has to see.
+fn delta_carries_payload(delta: &ChatCompletionChunkDelta) -> bool {
+    delta.role.is_some()
+        || delta.content.is_some()
+        || delta.reasoning_content.is_some()
+        || delta.tool_calls.is_some()
+}
+
+/// State collected while one direct provider stream is relayed.
+#[derive(Default)]
+struct DirectRelayState {
+    id: Option<String>,
+    model: Option<String>,
+    /// Last valid upstream usage block. Never forwarded verbatim.
+    usage: Option<OpenAIUsage>,
+    /// Last non-empty `finish_reason` the upstream supplied.
+    finish_reason: Option<String>,
+}
+
+impl DirectRelayState {
+    /// Fold one upstream chunk into the relay state.
+    ///
+    /// Returns the part of the chunk that still has to reach the client. Usage is collected,
+    /// never forwarded raw, and the finish reason is held back so every stream is closed by
+    /// exactly one terminal chunk. A frame that carried a finish reason and nothing else
+    /// therefore yields nothing here; its reason is emitted when the stream ends.
+    fn absorb(&mut self, mut chunk: ChatCompletionChunk) -> Option<ChatCompletionChunk> {
+        if self.id.is_none() && !chunk.id.trim().is_empty() {
+            self.id = Some(chunk.id.clone());
+            self.model = Some(chunk.model.clone());
+        }
+
+        if let Some(usage) = chunk.usage.take()
+            && is_valid_usage(&usage)
+        {
+            // The last valid upstream usage event wins; an invalid later one does not erase it.
+            self.usage = Some(usage);
+        }
+
+        let mut reason = None;
+        for choice in chunk.choices.iter_mut() {
+            // An empty string is not a termination signal. Several upstreams send it on every
+            // intermediate frame, and reading it as terminal dropped the real terminal frame.
+            if let Some(value) = choice.finish_reason.take() {
+                let value = value.trim();
+                if !value.is_empty() {
+                    reason = Some(value.to_string());
+                }
+            }
+        }
+        if reason.is_some() {
+            self.finish_reason = reason;
+        }
+
+        let carries_payload = chunk
+            .choices
+            .iter()
+            .any(|choice| delta_carries_payload(&choice.delta));
+        if !carries_payload {
+            return None;
+        }
+        if let Some(id) = &self.id {
+            chunk.id = id.clone();
+        }
+        Some(chunk)
+    }
+
+    /// Terminal chunk for this stream.
+    ///
+    /// The upstream reason is forwarded when it named one, otherwise it is inferred from the
+    /// last observed state. Usage rides on this chunk when the client asked for it, which keeps
+    /// `finish_reason` on the final frame rather than behind a usage event.
+    fn terminal(
+        &self,
+        include_usage: bool,
+        token_cap: Option<i64>,
+        model_fallback: &str,
+    ) -> ChatCompletionChunk {
+        let id = self
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("chatcmpl-{}", random_id()));
+        let model = self
+            .model
+            .clone()
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or_else(|| model_fallback.to_string());
+        let reason = self
+            .finish_reason
+            .clone()
+            .unwrap_or_else(|| inferred_finish_reason(self.usage.as_ref(), token_cap));
+        let mut terminal = ChatCompletionChunk::finish(&id, &model, &reason);
+        if include_usage {
+            terminal.usage = self.usage.clone();
+        }
+        terminal
+    }
+}
+
+/// Relay a direct provider stream to the client with a guaranteed terminal frame.
+///
+/// Every stream ends with one chunk whose `choices[0].finish_reason` is non-empty: the upstream
+/// value when it supplied one, an inferred `length` or `stop` when it did not. Content frames,
+/// including reasoning-only deltas, are forwarded as they arrive.
+fn relay_direct_provider_stream<S>(
     stream: S,
     include_usage: bool,
+    token_cap: Option<i64>,
+    model_fallback: String,
 ) -> Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>
 where
     S: Stream<Item = Result<ChatCompletionChunk>> + Send + 'static,
 {
-    let state = Arc::new(tokio::sync::RwLock::new(DirectUsageState::default()));
+    let state = Arc::new(tokio::sync::RwLock::new(DirectRelayState::default()));
     let scan_state = state.clone();
-    let mapped = stream
+    let forwarded = stream
         .scan((), move |_, item| {
             let state = scan_state.clone();
             async move {
                 match item {
-                    Ok(mut chunk) => {
-                        let mut saved = state.write().await;
-                        if let Some(usage) = chunk.usage.take() {
-                            // Keep the last valid upstream usage event; later valid values supersede earlier ones.
-                            if is_valid_usage(&usage) {
-                                saved.usage = Some(usage);
-                            }
-                            return Some(None);
-                        }
-                        if saved.id.is_none() {
-                            saved.id = Some(chunk.id.clone());
-                            saved.model = Some(chunk.model.clone());
-                        }
-                        if let Some(id) = &saved.id {
-                            chunk.id = id.clone();
-                        }
-                        Some(Some(Ok(chunk)))
+                    Ok(chunk) => {
+                        let mut state = state.write().await;
+                        Some(state.absorb(chunk).map(Ok))
                     }
-                    Err(e) => Some(Some(Err(e))),
+                    Err(err) => Some(Some(Err(err))),
                 }
             }
         })
         .filter_map(futures_util::future::ready);
+
     let trailer_state = state.clone();
     let trailer = futures_util::stream::once(async move {
-        if !include_usage {
-            return None;
-        }
-        let saved = trailer_state.read().await;
-        match (saved.usage.clone(), saved.id.as_ref(), saved.model.as_ref()) {
-            (Some(usage), Some(id), Some(model)) => {
-                Some(Ok(ChatCompletionChunk::usage(id, model, usage)))
-            }
-            _ => None,
-        }
-    })
-    .filter_map(futures_util::future::ready);
-    Box::pin(mapped.chain(trailer))
-}
+        let state = trailer_state.read().await;
+        Ok::<ChatCompletionChunk, anyhow::Error>(state.terminal(
+            include_usage,
+            token_cap,
+            &model_fallback,
+        ))
+    });
 
-#[derive(Default)]
-struct DirectUsageState {
-    id: Option<String>,
-    model: Option<String>,
-    usage: Option<OpenAIUsage>,
+    Box::pin(forwarded.chain(trailer))
 }
 
 #[cfg(test)]
@@ -1860,36 +2015,51 @@ mod usage_stream_tests {
             Ok(ChatCompletionChunk::finish("upstream-id", "m", "stop")),
             Ok(ChatCompletionChunk::usage("new", "m", usage(9))),
         ];
-        let output = filter_direct_usage_stream(stream::iter(chunks), true)
-            .collect::<Vec<_>>()
-            .await;
-        assert_eq!(output.len(), 3);
-        assert_eq!(output[0].as_ref().unwrap().id, "upstream-id");
-        assert_eq!(output[1].as_ref().unwrap().id, "upstream-id");
-        let trailer = output[2].as_ref().unwrap();
-        assert_eq!(trailer.id, "upstream-id");
-        assert_eq!(trailer.usage.as_ref().unwrap().prompt_tokens, 9);
-        assert!(trailer.choices.is_empty());
+        let output =
+            relay_direct_provider_stream(stream::iter(chunks), true, None, "m".to_string())
+                .collect::<Vec<_>>()
+                .await;
+        // The content frame survives, the two usage-only frames are folded away, and the
+        // terminal frame carries the newest usage and the upstream reason.
+        assert_eq!(output.len(), 2);
+        let content = output[0].as_ref().unwrap();
+        assert_eq!(content.id, "upstream-id");
+        assert_eq!(
+            content.choices[0].delta.content.as_deref(),
+            Some("hello"),
+            "content must not be lost while usage is collected"
+        );
+        let terminal = output[1].as_ref().unwrap();
+        assert_eq!(terminal.id, "upstream-id");
+        assert_eq!(
+            terminal.choices[0].finish_reason.as_deref(),
+            Some("stop"),
+            "the stream must close with the upstream reason"
+        );
+        assert_eq!(terminal.usage.as_ref().unwrap().prompt_tokens, 9);
     }
 
     #[tokio::test]
     async fn direct_provider_suppresses_usage_when_not_requested_or_missing() {
-        for (chunks, enabled, expected_len) in [
+        for (chunks, enabled) in [
             (
                 vec![Ok(ChatCompletionChunk::usage("id", "m", usage(1)))],
                 false,
-                0,
             ),
             (
                 vec![Ok(ChatCompletionChunk::finish("id", "m", "stop"))],
                 true,
-                1,
             ),
         ] {
-            let output = filter_direct_usage_stream(stream::iter(chunks), enabled)
-                .collect::<Vec<_>>()
-                .await;
-            assert_eq!(output.len(), expected_len);
+            let output =
+                relay_direct_provider_stream(stream::iter(chunks), enabled, None, "m".to_string())
+                    .collect::<Vec<_>>()
+                    .await;
+            // One terminal frame either way, and usage only when the client asked for it.
+            assert_eq!(output.len(), 1);
+            let terminal = output[0].as_ref().unwrap();
+            assert_eq!(terminal.choices[0].finish_reason.as_deref(), Some("stop"));
+            assert!(terminal.usage.is_none());
         }
     }
 
@@ -1910,6 +2080,283 @@ mod usage_stream_tests {
             let parsed: ChatRequest = serde_json::from_value(request).unwrap();
             assert_eq!(requests_usage(&parsed), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod direct_stream_relay_tests {
+    use super::*;
+    use tiny_http::{Header, Response, Server};
+
+    /// Captured shape of an OpenCode Go reasoning model: reasoning-only deltas, an empty
+    /// `finish_reason` string on every intermediate frame, and a terminal frame whose delta is
+    /// empty but which carries both `finish_reason` and a `usage` block with provider extras.
+    const REASONING_THEN_TERMINAL_USAGE: &str = r#"data: {"id":"gw-1","object":"chat.completion.chunk","created":1,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":""}]}
+data: {"id":"gw-1","object":"chat.completion.chunk","created":1,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"reasoning_content":"The"},"finish_reason":""}]}
+data: {"id":"gw-1","object":"chat.completion.chunk","created":1,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"reasoning_content":" user wants a"},"finish_reason":""}]}
+data: {"id":"gw-1","object":"chat.completion.chunk","created":1,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":""}]}
+data: {"id":"gw-1","object":"chat.completion.chunk","created":1,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":36,"completion_tokens":13,"total_tokens":49,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":10},"cost":0,"opencode":{"billing_source":"go","allowance":0.00000792}}}
+data: [DONE]
+"#;
+
+    /// A stream whose last frame is an ordinary content delta: no `finish_reason` anywhere.
+    const NO_FINISH_REASON: &str = r#"data: {"id":"gw-2","object":"chat.completion.chunk","created":1,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+data: {"id":"gw-2","object":"chat.completion.chunk","created":1,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"content":"ok"}}]}
+data: [DONE]
+"#;
+
+    /// A stream that ends without a reason while reporting usage that used the whole cap.
+    const CAP_EXHAUSTED_WITHOUT_FINISH_REASON: &str = r#"data: {"id":"gw-3","object":"chat.completion.chunk","created":1,"model":"glm-5.3","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+data: {"id":"gw-3","object":"chat.completion.chunk","created":1,"model":"glm-5.3","choices":[{"index":0,"delta":{"reasoning_content":"The"}}]}
+data: {"id":"gw-3","object":"chat.completion.chunk","created":1,"model":"glm-5.3","choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":18,"completion_tokens":16,"total_tokens":34,"opencode":{"billing_source":"go"}}}
+data: [DONE]
+"#;
+
+    /// The shape that produced an empty client stream: nothing usable arrives at all.
+    const EMPTY_STREAM: &str = "data: [DONE]\n";
+
+    /// An upstream that fails in band instead of closing the stream.
+    const ERROR_FRAME: &str = r#"data: {"error":{"message":"backend overloaded","type":"server_error"}}
+data: [DONE]
+"#;
+
+    /// Start a stub direct provider that answers `/models` with 404 and replays `body` as the
+    /// streaming completion, so the catalogue check falls through to dispatch.
+    fn spawn_stream_provider(body: &'static str) -> String {
+        let server = Server::http("127.0.0.1:0").expect("bind stub provider");
+        let base = format!(
+            "http://{}",
+            server.server_addr().to_ip().expect("stub provider ip")
+        );
+        std::thread::spawn(move || {
+            let sse_header = Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..])
+                .expect("sse content type");
+            let json_header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                .expect("json content type");
+            for request in server.incoming_requests() {
+                let response = if request.url().starts_with("/models") {
+                    Response::from_string("{}")
+                        .with_status_code(404)
+                        .with_header(json_header.clone())
+                } else {
+                    Response::from_string(body).with_header(sse_header.clone())
+                };
+                let _ = request.respond(response);
+            }
+        });
+        base
+    }
+
+    /// Drive one streaming completion through the client and collect the raw relay output.
+    async fn collect(body: &'static str, request_body: Value) -> Vec<Result<ChatCompletionChunk>> {
+        let base = spawn_stream_provider(body);
+        let client = LlmProviderClient::new();
+        client
+            .add_direct_provider(
+                "stub".to_string(),
+                base,
+                vec!["test-key".to_string()],
+                None,
+                None,
+            )
+            .await;
+        let mut input: ChatRequest =
+            serde_json::from_value(request_body).expect("build chat request");
+        input.stream = Some(true);
+        let stream = client
+            .chat_completion_stream(input)
+            .await
+            .expect("stream dispatch must reach the stub provider");
+        stream.collect().await
+    }
+
+    /// Same as [`collect`], for streams the relay must not fail.
+    async fn collect_chunks(body: &'static str, request_body: Value) -> Vec<ChatCompletionChunk> {
+        collect(body, request_body)
+            .await
+            .into_iter()
+            .map(|item| item.expect("the relayed stream must not fail"))
+            .collect()
+    }
+
+    fn request(model: &str, max_tokens: Option<i64>, include_usage: bool) -> Value {
+        let mut body = json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "reply with one word" }]
+        });
+        if let Some(cap) = max_tokens {
+            body["max_tokens"] = json!(cap);
+        }
+        if include_usage {
+            body["stream_options"] = json!({ "include_usage": true });
+        }
+        body
+    }
+
+    fn reasons(chunks: &[ChatCompletionChunk]) -> Vec<Option<String>> {
+        chunks
+            .iter()
+            .map(|chunk| {
+                chunk
+                    .choices
+                    .first()
+                    .and_then(|choice| choice.finish_reason.clone())
+            })
+            .collect()
+    }
+
+    fn reasoning(chunks: &[ChatCompletionChunk]) -> String {
+        chunks
+            .iter()
+            .filter_map(|chunk| chunk.choices.first())
+            .filter_map(|choice| choice.delta.reasoning_content.as_deref())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn reasoning_deltas_and_terminal_usage_frame_reach_the_client() {
+        let chunks = collect_chunks(
+            REASONING_THEN_TERMINAL_USAGE,
+            request("stub/deepseek-v4.1-flash", Some(16), false),
+        )
+        .await;
+
+        // The role frame, two reasoning frames and the content frame, then one terminal frame:
+        // the terminal frame used to be swallowed whole because it carried usage.
+        assert_eq!(chunks.len(), 5, "reasons: {:?}", reasons(&chunks));
+        assert_eq!(
+            reasoning(&chunks),
+            "The user wants a",
+            "reasoning-only deltas must not be dropped"
+        );
+        assert_eq!(
+            chunks[3].choices[0].delta.content.as_deref(),
+            Some("ok"),
+            "the content frame must survive the terminal frame"
+        );
+        assert_eq!(
+            reasons(&chunks),
+            vec![None, None, None, None, Some("stop".to_string())],
+            "the upstream reason must be forwarded on the last frame"
+        );
+        assert_eq!(chunks[4].id, "gw-1", "the upstream id is kept");
+
+        // The bytes a client receives: no intermediate frame may look terminal, and the last
+        // frame must name a reason.
+        for (index, chunk) in chunks.iter().enumerate().take(4) {
+            let frame = serde_json::to_value(chunk).expect("serialize frame");
+            assert!(
+                frame["choices"][0].get("finish_reason").is_none(),
+                "frame {index} must not carry a finish_reason: {frame}"
+            );
+        }
+        let terminal = serde_json::to_value(&chunks[4]).expect("serialize terminal frame");
+        assert_eq!(terminal["choices"][0]["finish_reason"], json!("stop"));
+    }
+
+    #[tokio::test]
+    async fn terminal_usage_stays_closed() {
+        let chunks = collect_chunks(
+            REASONING_THEN_TERMINAL_USAGE,
+            request("stub/deepseek-v4.1-flash", Some(16), true),
+        )
+        .await;
+
+        let terminal = chunks.last().expect("terminal frame");
+        let usage = terminal
+            .usage
+            .as_ref()
+            .expect("the requested usage must ride the terminal frame");
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (36, 13, 49)
+        );
+        let serialized = serde_json::to_value(terminal).expect("serialize terminal frame");
+        let mut keys: Vec<&str> = serialized["usage"]
+            .as_object()
+            .expect("usage object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["completion_tokens", "prompt_tokens", "total_tokens"],
+            "provider-specific usage fields must not leak: {serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_without_finish_reason_gets_a_synthesized_terminal_chunk() {
+        let chunks = collect_chunks(
+            NO_FINISH_REASON,
+            request("stub/deepseek-v4.1-flash", Some(16), false),
+        )
+        .await;
+
+        assert_eq!(chunks.len(), 3, "reasons: {:?}", reasons(&chunks));
+        assert_eq!(
+            reasons(&chunks),
+            vec![None, None, Some("stop".to_string())],
+            "a stream that ended on its own closes with stop"
+        );
+        assert_eq!(chunks[2].id, "gw-2");
+        assert_eq!(chunks[2].model, "deepseek-v4.1-flash");
+    }
+
+    #[tokio::test]
+    async fn stream_that_used_the_token_cap_reports_length() {
+        let chunks = collect_chunks(
+            CAP_EXHAUSTED_WITHOUT_FINISH_REASON,
+            request("stub/glm-5.3", Some(16), false),
+        )
+        .await;
+
+        assert_eq!(
+            reasons(&chunks),
+            vec![None, None, Some("length".to_string())],
+            "usage equal to the requested cap means the stream was truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_upstream_stream_still_closes_with_a_terminal_chunk() {
+        let chunks = collect_chunks(EMPTY_STREAM, request("stub/glm-5.3", Some(16), false)).await;
+
+        assert_eq!(
+            chunks.len(),
+            1,
+            "an empty upstream stream must not relay nothing"
+        );
+        assert_eq!(chunks[0].choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            chunks[0].model, "glm-5.3",
+            "the requested model names the frame"
+        );
+        assert!(
+            chunks[0].id.starts_with("chatcmpl-"),
+            "an id is minted when the upstream never supplied one: {}",
+            chunks[0].id
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_error_frame_is_surfaced_instead_of_an_empty_stream() {
+        let output = collect(ERROR_FRAME, request("stub/glm-5.3", Some(16), false)).await;
+
+        let err = output
+            .first()
+            .expect("the error frame must produce an item")
+            .as_ref()
+            .expect_err("an in-band upstream error must not be dropped");
+        assert!(
+            err.to_string().contains("backend overloaded"),
+            "the upstream message must survive: {err}"
+        );
     }
 }
 
