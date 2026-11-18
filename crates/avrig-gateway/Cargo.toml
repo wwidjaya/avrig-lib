@@ -1,0 +1,27 @@
+[package]
+name = "avrig-gateway"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Pure LLM provider gateway adapters, converters, and multi-account client pool for avrig"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "stream", "blocking"] }
+tiny_http = "0.12"
+url = "2.5"
+anyhow = "1"
+base64 = "0.22"
+sha2 = "0.10"
+rand = "0.8"
+tokio-stream = "0.1"
+futures-util = "0.3"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

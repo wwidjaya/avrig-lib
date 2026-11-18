@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/avrig-logging",
+    "crates/avrig-gateway",
+]
+resolver = "2"
