@@ -679,9 +679,57 @@ impl LlmProviderClient {
         execute_antigravity_non_stream(&account.state, &input).await
     }
 
+    /// Dispatch a streaming chat completion and trace the routing decision.
+    ///
+    /// Field names and levels match [`Self::chat_completion`], so one search over the logs sees
+    /// every request either way. The trace is written when the stream is handed back, which is
+    /// the point at which the upstream status is known; chunk-level failures are traced where
+    /// they happen, by the callers relaying the stream.
     pub async fn chat_completion_stream(
         &self,
+        input: ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>> {
+        let started = std::time::Instant::now();
+        let requested_model = input.model.trim().to_string();
+        let mut trace = ChatDispatchTrace {
+            provider: self.resolve_provider_name(&requested_model).await,
+            resolved_model: resolve_upstream_model_id(&requested_model),
+            requested_model,
+            upstream_status: None,
+        };
+
+        let result = self
+            .dispatch_chat_completion_stream(input, &mut trace)
+            .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        match &result {
+            Ok(_) => tracing::info!(
+                provider = %trace.provider,
+                requested_model = %trace.requested_model,
+                upstream_model = %trace.resolved_model,
+                upstream_status = ?trace.upstream_status,
+                elapsed_ms = elapsed_ms,
+                "chat completion stream dispatched"
+            ),
+            Err(err) => tracing::warn!(
+                provider = %trace.provider,
+                requested_model = %trace.requested_model,
+                upstream_model = %trace.resolved_model,
+                upstream_status = ?trace.upstream_status,
+                elapsed_ms = elapsed_ms,
+                error = %err,
+                "chat completion stream dispatch failed"
+            ),
+        }
+
+        result
+    }
+
+    async fn dispatch_chat_completion_stream(
+        &self,
         mut input: ChatRequest,
+        trace: &mut ChatDispatchTrace,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>> {
         let original_model = input.model.clone();
         let (prefix, base_model) = strip_model_prefix(&original_model);
@@ -704,8 +752,21 @@ impl LlmProviderClient {
                 )
                 .await?;
                 input.model = base_model;
-                return execute_direct_provider_stream(&self.http, &direct, key_index, &input)
-                    .await;
+                // Match the non-stream path: the trace names the model actually dispatched.
+                trace.resolved_model = input.model.clone();
+                return match execute_direct_provider_stream(&self.http, &direct, key_index, &input)
+                    .await
+                {
+                    Ok(stream) => {
+                        // A non-2xx status returns early as an error, so this is the success code.
+                        trace.upstream_status = Some(200);
+                        Ok(stream)
+                    }
+                    Err(err) => {
+                        trace.upstream_status = upstream_status_of(&err);
+                        Err(err)
+                    }
+                };
             }
             if !is_builtin_model_prefix(p) {
                 return Err(ModelResolutionError::ModelNotFound {
@@ -731,7 +792,19 @@ impl LlmProviderClient {
             let directs = self.direct_providers.read().await;
             if let Some(direct) = directs.values().next() {
                 let key_index = direct.next_key_index();
-                return execute_direct_provider_stream(&self.http, direct, key_index, &input).await;
+                return match execute_direct_provider_stream(&self.http, direct, key_index, &input)
+                    .await
+                {
+                    Ok(stream) => {
+                        // A non-2xx status returns early as an error, so this is the success code.
+                        trace.upstream_status = Some(200);
+                        Ok(stream)
+                    }
+                    Err(err) => {
+                        trace.upstream_status = upstream_status_of(&err);
+                        Err(err)
+                    }
+                };
             }
             return Err(anyhow!("No Antigravity accounts available"));
         }
